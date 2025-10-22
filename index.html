@@ -26,79 +26,86 @@
         }
 
         // ==========================================================
-        // API YAPILANDIRMASI - SERPAPI
+        // API YAPILANDIRMASI - VERCEL PROXY ENDPOINT
         // ==========================================================
         
-        // 1. SerpApi Anahtarı (Kullanıcı tarafından sağlandı)
-        // **ÖNEMLİ GÜVENLİK NOTU: API ANAHTARLARI ASLA DOĞRUDAN FRONTEND (TARAYICI) KODUNDA BULUNMAMALIDIR.**
-        const SERPAPI_KEY = 'd026159011e6574789aadbc79f8ba8a56adacfdd4d680b7494bee74cce0834a'; 
-        
-        // 2. SerpApi Temel URL'si
-        const API_BASE_URL = 'https://serpapi.com/search'; 
+        // VERCEL SERVERLESS FUNCTION ENDPOINT'i kullanıyoruz.
+        // Bu endpoint, sunucu tarafında SerpApi çağrısını güvenli bir şekilde yapar.
+        const PROXY_API_URL = '/api/app-search'; 
+
+        // Not: API Anahtarı artık frontend kodunda bulunmamaktadır.
+        // Anahtar, Vercel Serverless Function (api/app-search.js) dosyasında, ortam değişkenlerinden çekilecektir.
 
         // ==========================================================
-        // ÜSTEL GERİ ÇEKİLME (EXPONENTIAL BACKOFF) - Üretim Ortamına Hazırlık
+        // HATA YÖNETİMİ VE BACKOFF MANTIĞI
         // ==========================================================
 
         /**
-         * API çağrılarını ağ hataları veya hız limiti hataları için yeniden deneyen robust bir fetch fonksiyonu.
+         * Proxy'ye çağrıları ağ hataları için yeniden deneyen robust bir fetch fonksiyonu.
          */
         async function exponentialBackoffFetch(url, options = {}, maxRetries = 3) {
             let delay = 1000; // Başlangıç gecikmesi 1 saniye
             for (let i = 0; i < maxRetries; i++) {
                 try {
                     const response = await fetch(url, options);
+                    
                     if (response.ok) {
                         return response;
                     }
-                    // 429 (Rate Limit) gibi hatalarda yeniden dene
-                    if (response.status === 429 && i < maxRetries - 1) {
-                        console.warn(`Hız Limiti Aşıldı (429). ${delay / 1000} saniye sonra yeniden deneniyor... Deneme ${i + 1}/${maxRetries}`);
+
+                    // 400 ve 500 seviyesi hatalar için yeniden denemeden hata fırlat.
+                    // Bu hatalar kalıcıdır (Yetkilendirme, Sunucu Ayar Hatası vb.)
+                    if (response.status >= 400) {
+                         const errorJson = await response.json().catch(() => ({}));
+                         const errorMessage = errorJson.error || `Proxy Sunucu Hatası: Durum Kodu ${response.status}.`;
+
+                         if (errorMessage.includes('Sunucu hatası: SerpApi anahtarı')) {
+                             throw { message: `Yetkilendirme Hatası: Vercel Ortam Değişkenlerinizde "SERPAPI_KEY" tanımlı değil.` };
+                         }
+
+                         if (response.status === 401 || response.status === 403) {
+                             throw { message: `Yetkilendirme Hatası: Sunucu, API Anahtarınızın geçersiz olduğunu bildirdi.` };
+                         }
+
+                         throw { message: errorMessage };
+                    }
+                    
+                    // Ağ kesintisi veya geçici hatalar için yeniden deneme
+                    if (i < maxRetries - 1) {
+                        console.warn(`Geçici Ağ Hatası. ${delay / 1000} saniye sonra yeniden deneniyor... Deneme ${i + 1}/${maxRetries}`);
                         await new Promise(resolve => setTimeout(resolve, delay));
                         delay *= 2; // Gecikmeyi iki katına çıkar
                         continue;
                     }
-                    // Diğer sunucu hatalarında hemen hata fırlat
-                    const errorJson = await response.json().catch(() => ({}));
-                    throw { message: errorJson.error || `API Sunucu Hatası: Durum Kodu ${response.status}.` };
+                    
+                    // Son denemede genel hata fırlat
+                    throw { message: `API çağrısı ${maxRetries} denemeden sonra başarısız oldu.` };
+
                 } catch (error) {
-                    // Ağ hatalarında (CORS dahil) yeniden deneme (Yalnızca production ortamında faydalıdır)
-                    if (i < maxRetries - 1) {
+                    // Ağ hatalarında yeniden deneme
+                    if (i < maxRetries - 1 && !error.message.includes('Yetkilendirme Hatası') && !error.message.includes('Sunucu iç hatası')) {
                         await new Promise(resolve => setTimeout(resolve, delay));
                         delay *= 2;
                         continue;
                     }
-                    throw error; // Son denemede hata fırlat
+                    throw error; // Son denemede veya kalıcı hatada fırlat
                 }
             }
         }
 
         /**
-         * Verilen App Adı/Terimine göre uygulama detaylarını SerpApi'den çeker.
+         * Verilen App Adı/Terimine göre uygulama detaylarını SerpApi'den çeker (Proxy üzerinden).
          */
         async function fetchAppDetails(searchTerm) {
             
-            // Kullanıcının başlangıçtaki curl sorgusuna benzer global ayarlar kullanıldı.
-            const params = new URLSearchParams({
-                api_key: SERPAPI_KEY,
-                engine: "apple_app_store", // iOS App Store motoru
-                term: searchTerm,
-                country: "us", // Global varsayılan
-                lang: "en-us", // Global varsayılan
-                num: "1" // Sadece ilk (en alakalı) sonucu getir
-            });
-            
-            const url = `${API_BASE_URL}?${params.toString()}`;
-            const storeDisplay = "App Store (iOS) Search, US/Global";
-
-            if (!SERPAPI_KEY || SERPAPI_KEY.length < 32) {
-                 throw { message: "SerpApi Anahtarı eksik veya geçersiz. Lütfen kontrol ediniz." };
-            }
+            // Proxy endpoint'ine sadece arama terimini gönderiyoruz.
+            const url = `${PROXY_API_URL}?term=${encodeURIComponent(searchTerm)}`;
 
             try {
                 // Exponential Backoff ile fetch isteği
                 const response = await exponentialBackoffFetch(url);
                 
+                // Yanıt, doğrudan SerpApi'den gelen sonuç (API anahtarı kontrol edildiği için güvenli)
                 const apiData = await response.json();
                 
                 // SerpApi, sonuçları 'organic_results' dizisi içinde döndürür. Biz ilk sonucu alıyoruz.
@@ -117,7 +124,7 @@
                 return {
                     name: appData.title || 'Bilinmiyor',
                     developer: appData.developer?.name || 'Bilinmiyor',
-                    store: storeDisplay,
+                    store: "App Store (iOS) Search, US/Global (Proxy ile Güvenli)",
                     appId: appData.id || appData.bundle_id || 'N/A',
                     
                     // Yayınlanma ve Sürüm Bilgileri
@@ -133,7 +140,7 @@
 
             } catch (error) {
                 // Hata mesajını daha anlaşılır hale getir
-                throw { message: `Sorgu sırasında hata oluştu: ${error.message || error}. (CORS/Ağ Güvenlik Uyarısı)` };
+                throw { message: `${error.message || "Bilinmeyen bir API çağrı hatası oluştu."}` };
             }
         }
 
@@ -200,6 +207,7 @@
                 displayResults(data);
             } catch (error) {
                 console.error("Sorgulama Hatası:", error);
+                // Hata mesajını temizleyip sadece kullanıcıya gösterecek şekilde çağırıyoruz.
                 displayError(error.message || "Bilinmeyen bir hata oluştu.");
             } finally {
                 // Arayüzü eski haline getir
@@ -216,7 +224,7 @@
     <div class="max-w-4xl mx-auto">
         <header class="text-center mb-10">
             <h1 class="text-4xl font-extrabold text-gray-800">SKCore Uygulama Bilgi Sorgulama</h1>
-            <p class="text-gray-500 mt-2">Uygulama adını veya arama terimini girerek App Store detaylarını anında öğrenin (SerpApi ile).</p>
+            <p class="text-gray-500 mt-2">Uygulama adını veya arama terimini girerek App Store detaylarını anında öğrenin (Vercel Proxy ile).</p>
         </header>
 
         <!-- Sorgu Alanı -->
@@ -245,7 +253,11 @@
 
              <!-- API Yapılandırma Uyarısı -->
              <p class="mt-4 text-sm font-medium text-red-600">
-                ⚠️ **ÖNEMLİ UYARI:** Bu kod artık yeniden deneme (retry) mantığına sahiptir ve üretim ortamı için hazırdır. Ancak, bu kod tarayıcıda doğrudan çalıştırılırken **CORS (Ağ Güvenlik)** kısıtlaması nedeniyle hâlâ "failed to fetch" hatası verecektir. **Dağıtımı (Deployment) bir sunucu ortamında yapmanız gerekmektedir.**
+                ✅ **CORS/Failed to fetch HATASI ÇÖZÜLDÜ!** Bu sayfa artık **Vercel Serverless Function**'ınıza (`/api/app-search`) istek gönderiyor.
+                <br>
+                ⚠️ **SON ADIM:** Bu çözümün çalışması için lütfen 
+                1. Bu kodun hemen üstündeki **`api/app-search.js`** dosyasını Vercel projenizin `api` klasörüne ekleyin.
+                2. Vercel projenizin ortam değişkenlerine **`SERPAPI_KEY`** adında SerpApi anahtarınızı ekleyin.
             </p>
         </div>
 
