@@ -38,7 +38,7 @@ module.exports = async (req, res) => {
             api_key: SERPAPI_KEY,
             engine: "apple_app_store",
             term: term,
-            country: "us",
+            country: "vn",
             lang: "en-us",
             num: "1"
         });
