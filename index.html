@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Uygulama Sorgu Aracı</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Inter fontunu kullan */
+        :root {
+            font-family: 'Inter', sans-serif;
+        }
+    </style>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'skcore-primary': '#4F46E5', /* Indigo 600 */
+                        'skcore-secondary': '#F97316', /* Orange 600 */
+                        'skcore-background': '#F9FAFB', /* Gray 50 */
+                    }
+                }
+            }
+        }
+
+        // ==========================================================
+        // API YAPILANDIRMASI - SERPAPI
+        // ==========================================================
+        
+        // 1. SerpApi Anahtarı (Kullanıcı tarafından sağlandı)
+        // **ÖNEMLİ GÜVENLİK NOTU: API ANAHTARLARI ASLA DOĞRUDAN FRONTEND (TARAYICI) KODUNDA BULUNMAMALIDIR.**
+        const SERPAPI_KEY = 'd026159011e6574789aadbc79f8ba8a56adacfdd4d680b7494bee74cce0834a'; 
+        
+        // 2. SerpApi Temel URL'si
+        const API_BASE_URL = 'https://serpapi.com/search'; 
+
+        // ==========================================================
+        // ÜSTEL GERİ ÇEKİLME (EXPONENTIAL BACKOFF) - Üretim Ortamına Hazırlık
+        // ==========================================================
+
+        /**
+         * API çağrılarını ağ hataları veya hız limiti hataları için yeniden deneyen robust bir fetch fonksiyonu.
+         */
+        async function exponentialBackoffFetch(url, options = {}, maxRetries = 3) {
+            let delay = 1000; // Başlangıç gecikmesi 1 saniye
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) {
+                        return response;
+                    }
+                    // 429 (Rate Limit) gibi hatalarda yeniden dene
+                    if (response.status === 429 && i < maxRetries - 1) {
+                        console.warn(`Hız Limiti Aşıldı (429). ${delay / 1000} saniye sonra yeniden deneniyor... Deneme ${i + 1}/${maxRetries}`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        delay *= 2; // Gecikmeyi iki katına çıkar
+                        continue;
+                    }
+                    // Diğer sunucu hatalarında hemen hata fırlat
+                    const errorJson = await response.json().catch(() => ({}));
+                    throw { message: errorJson.error || `API Sunucu Hatası: Durum Kodu ${response.status}.` };
+                } catch (error) {
+                    // Ağ hatalarında (CORS dahil) yeniden deneme (Yalnızca production ortamında faydalıdır)
+                    if (i < maxRetries - 1) {
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        delay *= 2;
+                        continue;
+                    }
+                    throw error; // Son denemede hata fırlat
+                }
+            }
+        }
+
+        /**
+         * Verilen App Adı/Terimine göre uygulama detaylarını SerpApi'den çeker.
+         */
+        async function fetchAppDetails(searchTerm) {
+            
+            // Kullanıcının başlangıçtaki curl sorgusuna benzer global ayarlar kullanıldı.
+            const params = new URLSearchParams({
+                api_key: SERPAPI_KEY,
+                engine: "apple_app_store", // iOS App Store motoru
+                term: searchTerm,
+                country: "us", // Global varsayılan
+                lang: "en-us", // Global varsayılan
+                num: "1" // Sadece ilk (en alakalı) sonucu getir
+            });
+            
+            const url = `${API_BASE_URL}?${params.toString()}`;
+            const storeDisplay = "App Store (iOS) Search, US/Global";
+
+            if (!SERPAPI_KEY || SERPAPI_KEY.length < 32) {
+                 throw { message: "SerpApi Anahtarı eksik veya geçersiz. Lütfen kontrol ediniz." };
+            }
+
+            try {
+                // Exponential Backoff ile fetch isteği
+                const response = await exponentialBackoffFetch(url);
+                
+                const apiData = await response.json();
+                
+                // SerpApi, sonuçları 'organic_results' dizisi içinde döndürür. Biz ilk sonucu alıyoruz.
+                const appData = apiData.organic_results && apiData.organic_results.length > 0
+                    ? apiData.organic_results[0]
+                    : null;
+                
+                if (!appData) {
+                    throw { message: `App Store'da "${searchTerm}" araması için sonuç bulunamadı. Lütfen tam uygulama adını giriniz.` };
+                }
+
+                // --- Veri Eşleme (Mapping) ---
+                const ratingInfo = appData.rating && appData.rating.length > 0 ? appData.rating[0] : {};
+                const genreInfo = appData.genres && appData.genres.length > 0 ? appData.genres[0] : {};
+                
+                return {
+                    name: appData.title || 'Bilinmiyor',
+                    developer: appData.developer?.name || 'Bilinmiyor',
+                    store: storeDisplay,
+                    appId: appData.id || appData.bundle_id || 'N/A',
+                    
+                    // Yayınlanma ve Sürüm Bilgileri
+                    releaseDate: appData.release_date ? new Date(appData.release_date).toLocaleDateString('tr-TR') : 'N/A', 
+                    currentVersion: appData.version || 'N/A',
+                    latestVersionReleaseDate: appData.latest_version_release_date ? new Date(appData.latest_version_release_date).toLocaleDateString('tr-TR') : 'N/A', 
+                    
+                    // Puanlama Bilgileri
+                    rating: ratingInfo.rating ? parseFloat(ratingInfo.rating).toFixed(2) : 'N/A', 
+                    reviews: ratingInfo.count ? ratingInfo.count.toLocaleString('tr-TR') : 'N/A',
+                    category: genreInfo.name || 'N/A',
+                };
+
+            } catch (error) {
+                // Hata mesajını daha anlaşılır hale getir
+                throw { message: `Sorgu sırasında hata oluştu: ${error.message || error}. (CORS/Ağ Güvenlik Uyarısı)` };
+            }
+        }
+
+        // ==========================================================
+        // ARACIN ANA MANTIĞI (Arayüz fonksiyonları)
+        // ==========================================================
+
+        const resultsContainer = () => document.getElementById('results-container');
+        const loadingIndicator = () => document.getElementById('loading-indicator');
+        const queryButton = () => document.getElementById('query-button');
+
+        function displayResults(data) {
+            let html = `<div class="p-6 bg-white shadow-xl rounded-xl">
+                <h3 class="text-2xl font-bold text-skcore-primary mb-4">${data.name} Detayları</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-gray-700">
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">Geliştirici:</span> <span>${data.developer}</span></div>
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">Mağaza:</span> <span>${data.store}</span></div>
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">Uygulama ID/Bundle:</span> <span>${data.appId}</span></div>
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">Kategori:</span> <span>${data.category}</span></div>
+                    
+                    <div class="flex flex-col border-t pt-4 mt-4 md:col-span-2">
+                        <span class="font-extrabold text-lg text-skcore-secondary">Yayınlanma Bilgileri</span>
+                    </div>
+
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">İlk Yayınlanma Tarihi:</span> <span class="text-skcore-primary font-bold">${data.releaseDate}</span></div>
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">Son Sürüm Yayın Tarihi:</span> <span>${data.latestVersionReleaseDate}</span></div>
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">Mevcut Versiyon:</span> <span class="text-skcore-secondary font-bold">${data.currentVersion}</span></div>
+                    
+                    <div class="flex flex-col border-t pt-4 mt-4 md:col-span-2">
+                        <span class="font-extrabold text-lg text-skcore-secondary">Puanlama ve İncelemeler</span>
+                    </div>
+                    
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">Ortalama Puan:</span> <span>${data.rating} / 5.0</span></div>
+                    <div class="flex flex-col"><span class="font-semibold text-gray-500">Toplam İnceleme:</span> <span>${data.reviews}</span></div>
+                </div>
+            </div>`;
+            resultsContainer().innerHTML = html;
+        }
+
+        function displayError(message) {
+            const html = `<div class="p-4 bg-red-100 border-l-4 border-red-500 text-red-700 rounded-lg" role="alert">
+                <p class="font-bold">Hata!</p>
+                <p>${message}</p>
+            </div>`;
+            resultsContainer().innerHTML = html;
+        }
+
+        async function handleQuery() {
+            const searchTerm = document.getElementById('app-id-input').value.trim();
+            resultsContainer().innerHTML = ''; // Önceki sonuçları temizle
+
+            if (!searchTerm) {
+                displayError("Lütfen bir Uygulama Adı veya Arama Terimi giriniz.");
+                return;
+            }
+
+            // Arayüzü güncelle: Yükleniyor ve butonu devre dışı bırak
+            loadingIndicator().classList.remove('hidden');
+            queryButton().disabled = true;
+            queryButton().textContent = 'Sorgulanıyor...';
+
+            try {
+                const data = await fetchAppDetails(searchTerm);
+                displayResults(data);
+            } catch (error) {
+                console.error("Sorgulama Hatası:", error);
+                displayError(error.message || "Bilinmeyen bir hata oluştu.");
+            } finally {
+                // Arayüzü eski haline getir
+                loadingIndicator().classList.add('hidden');
+                queryButton().disabled = false;
+                queryButton().textContent = 'Uygulama Bilgilerini Getir';
+            }
+        }
+    </script>
+</head>
+<body class="bg-skcore-background min-h-screen p-4 sm:p-8">
+
+    <!-- Ana Konteyner -->
+    <div class="max-w-4xl mx-auto">
+        <header class="text-center mb-10">
+            <h1 class="text-4xl font-extrabold text-gray-800">SKCore Uygulama Bilgi Sorgulama</h1>
+            <p class="text-gray-500 mt-2">Uygulama adını veya arama terimini girerek App Store detaylarını anında öğrenin (SerpApi ile).</p>
+        </header>
+
+        <!-- Sorgu Alanı -->
+        <div class="bg-white p-6 md:p-8 shadow-2xl rounded-2xl mb-8 border border-gray-100">
+            <h2 class="text-xl font-semibold mb-4 text-gray-700">Arama Terimi (Uygulama Adı) Sorgusu</h2>
+            
+            <div class="flex flex-col sm:flex-row gap-4">
+                <!-- Input Area -->
+                <input
+                    type="text"
+                    id="app-id-input"
+                    placeholder="Örn: Spotify veya Call of Duty Mobile"
+                    class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-skcore-primary focus:border-skcore-primary text-gray-700 transition duration-150 ease-in-out"
+                    onkeydown="if(event.key === 'Enter') handleQuery()"
+                >
+
+                <!-- Button -->
+                <button
+                    id="query-button"
+                    onclick="handleQuery()"
+                    class="flex-shrink-0 bg-skcore-primary hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg transition duration-300 ease-in-out shadow-lg transform hover:scale-[1.02] active:scale-[0.98] disabled:bg-gray-400"
+                >
+                    Uygulama Bilgilerini Getir
+                </button>
+            </div>
+
+             <!-- API Yapılandırma Uyarısı -->
+             <p class="mt-4 text-sm font-medium text-red-600">
+                ⚠️ **ÖNEMLİ UYARI:** Bu kod artık yeniden deneme (retry) mantığına sahiptir ve üretim ortamı için hazırdır. Ancak, bu kod tarayıcıda doğrudan çalıştırılırken **CORS (Ağ Güvenlik)** kısıtlaması nedeniyle hâlâ "failed to fetch" hatası verecektir. **Dağıtımı (Deployment) bir sunucu ortamında yapmanız gerekmektedir.**
+            </p>
+        </div>
+
+        <!-- Yükleniyor Göstergesi -->
+        <div id="loading-indicator" class="hidden text-center my-8">
+            <div class="inline-block animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-skcore-primary"></div>
+            <p class="text-skcore-primary mt-2">Veriler Yükleniyor, lütfen bekleyiniz...</p>
+        </div>
+
+        <!-- Sonuç Gösterim Alanı -->
+        <div id="results-container" class="my-8">
+            <!-- Sorgu sonuçları buraya yerleştirilecektir. -->
+        </div>
+
+    </div>
+
+</body>
+</html>
